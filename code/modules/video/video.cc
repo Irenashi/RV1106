@@ -75,6 +75,7 @@ Video::Video(int width, int height, int model_width, int model_height)
       model_width_(model_width), model_height_(model_height),
       H264_TimeRef_(0), 
       g_rtsplive_(NULL), g_rtsp_session_(NULL), 
+      recording_(width, height),
       running_(false), 
       ai_enable_(false), area_enable_(false), obj_enable_(false), 
       control_(nullptr), 
@@ -92,9 +93,6 @@ Video::Video(int width, int height, int model_width, int model_height)
     memset(&rknn_app_ctx_, 0, sizeof(rknn_app_context_t));
 #if defined(ENABLE_FPS_CONSOLE) || defined(ENABLE_FPS_DISPLAY)
     memset(&fps_start_time_, 0, sizeof(struct timeval));
-#endif
-#ifdef ENABLE_FPS_DISPLAY
-    memset(&program_start_time_, 0, sizeof(struct timeval));
 #endif
 
     // ===== DMA 内存分配（RGA 硬件加速必须使用 DMA buf）=====
@@ -258,7 +256,15 @@ bool Video::init() {
     
     // 6. RTSP服务器初始化
     g_rtsplive_ = create_rtsp_demo(554);
+    if (!g_rtsplive_) {
+        fprintf(stderr, "[Video] RTSP 服务创建失败（端口 554）\n");
+        return false;
+    }
     g_rtsp_session_ = rtsp_new_session(g_rtsplive_, "/live/0");
+    if (!g_rtsp_session_) {
+        fprintf(stderr, "[Video] RTSP /live/0 会话创建失败\n");
+        return false;
+    }
     rtsp_set_video(g_rtsp_session_, RTSP_CODEC_ID_VIDEO_H264, NULL, 0);
     rtsp_sync_video_ts(g_rtsp_session_, rtsp_get_reltime(), rtsp_get_ntptime());
     printf("[Video] ✅ RTSP服务器初始化成功（端口554）\n");
@@ -288,6 +294,7 @@ bool Video::init() {
  * @return true=成功, false=失败
  */
 bool Video::start() {
+    recording_.start();  // SD 未挂载时只关闭录像，不影响直播
     running_ = true;
     
     // 创建采集线程
@@ -354,6 +361,7 @@ void Video::stop() {
         thread_encode_ = 0;
         printf("[Video] 编码线程已停止\n");
     }
+    recording_.stop();
     
     // 释放硬件资源
     RK_MPI_MB_ReleaseMB(src_Blk_);
@@ -424,6 +432,7 @@ void Video::pauseAllThreads() {
         thread_encode_ = 0;
         printf("[Video]    ✅ 编码推流线程已暂停\n");
     }
+    recording_.stop();  // 完成当前录像片段，暂停期间也可以查看已保存文件
     
     printf("[Video] ✅ 所有线程已暂停（硬件资源保持激活）\n");
 }
@@ -438,6 +447,7 @@ void Video::resumeAllThreads() {
     }
     
     printf("[Video] ▶️  恢复所有线程...\n");
+    recording_.start();
     running_ = true;
     
     // 重启4个线程
@@ -944,8 +954,8 @@ void Video::inferenceLoop() {
 // 绘制（frame_ 为 RGB 字节序，Scalar 以 R-G-B 解读）：
 //  - 检测框：绿色 Scalar(0,255,0)，标签文字同色
 //  - ROI 区域框：蓝色 Scalar(0,0,255)
-//  - FPS 数值：绿色，右上角
-//  - 运行时长：白色 Scalar(255,255,255)，FPS 下方
+//  - 北京时间：白色 Scalar(255,255,255)，右上角
+//  - FPS 数值：绿色，时间下方
 //
 // 编码路径：
 //  memcpy(frame_.data → VENC DMA MB data_) →
@@ -967,9 +977,6 @@ void Video::encodeLoop() {
     frame_count_ = 0;
     gettimeofday(&fps_start_time_, NULL);
     current_fps_ = 0.0f;
-#endif
-#ifdef ENABLE_FPS_DISPLAY
-    gettimeofday(&program_start_time_, NULL);  // 记录程序启动时间
 #endif
     
 #ifdef ENABLE_PERFORMANCE_TIMING
@@ -1091,29 +1098,34 @@ void Video::encodeLoop() {
         }
 
 #ifdef ENABLE_FPS_DISPLAY
-        // 计算运行时间（分:秒.毫秒）
-        double runtime = (current_time.tv_sec - program_start_time_.tv_sec) + 
-                        (current_time.tv_usec - program_start_time_.tv_usec) / 1000000.0;
-        int minutes = (int)(runtime / 60);
-        int seconds = (int)runtime % 60;
-        int milliseconds = (int)((runtime - (int)runtime) * 1000);
-        
-        // 绘制FPS和运行时间
-        if (current_fps_ > 0.0f) {
-            char fps_text[32];
-            sprintf(fps_text, "%.1f", current_fps_);  // 显示1位小数
-            // RGB Mat：Scalar(0,255,0) = 绿色
-            cv::putText(frame_, fps_text, 
-                       cv::Point(width_ - 60, height_ / 4), 
-                       cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
-            
-            // 在FPS下方显示运行时间（白色）
+        // 固定采用 UTC+8，避免开发板的 TZ 设置影响北京时间显示。
+        const time_t beijing_seconds = current_time.tv_sec + 8 * 60 * 60;
+        const double overlay_font_scale = 0.6;
+        const int overlay_thickness = 2;
+        const cv::Scalar overlay_color(0, 255, 0); // RGB Mat 中为绿色
+        const int overlay_right_margin = 16;
+        struct tm beijing_time;
+        if (gmtime_r(&beijing_seconds, &beijing_time)) {
             char time_text[32];
-            sprintf(time_text, "%02d:%02d.%03d", minutes, seconds, milliseconds);
-            cv::putText(frame_, time_text, 
-                       cv::Point(width_ - 90, height_ / 4 + 25), 
-                       cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(255, 255, 255), 1);
+            if (strftime(time_text, sizeof(time_text), "%Y-%m-%d %H:%M:%S", &beijing_time)) {
+                // 时间格式固定为 19 个字符，按当前字体估算宽度以靠右显示。
+                const int time_width = 220;
+                const int time_x = width_ > time_width + overlay_right_margin
+                    ? width_ - time_width - overlay_right_margin : 10;
+                cv::putText(frame_, time_text, cv::Point(time_x, 30),
+                            cv::FONT_HERSHEY_SIMPLEX, overlay_font_scale,
+                            overlay_color, overlay_thickness);
+            }
         }
+
+        char fps_text[32];
+        snprintf(fps_text, sizeof(fps_text), "FPS:%.1f", current_fps_);
+        const int fps_width = 90;
+        const int fps_x = width_ > fps_width + overlay_right_margin
+            ? width_ - fps_width - overlay_right_margin : 10;
+        cv::putText(frame_, fps_text, cv::Point(fps_x, 58),
+                    cv::FONT_HERSHEY_SIMPLEX, overlay_font_scale,
+                    overlay_color, overlay_thickness);
 #endif
 #endif
         
@@ -1128,7 +1140,11 @@ void Video::encodeLoop() {
         h264_frame_.stVFrame.u64PTS = timestamp;
         memcpy(data_, frame_.data, width_ * height_ * 3);
         
-        RK_MPI_VENC_SendFrame(0, &h264_frame_, -1);
+        RK_S32 sendRet = RK_MPI_VENC_SendFrame(0, &h264_frame_, -1);
+        if (sendRet != RK_SUCCESS) {
+            fprintf(stderr, "[Video] VENC SendFrame 失败: %d\n", sendRet);
+            continue;
+        }
         s32Ret = RK_MPI_VENC_GetStream(0, &stFrame_, -1);
         
 #ifdef ENABLE_PERFORMANCE_TIMING
@@ -1138,11 +1154,18 @@ void Video::encodeLoop() {
 #endif
         
         // 推流
-        if(s32Ret == RK_SUCCESS && g_rtsplive_ && g_rtsp_session_) {
+        if (s32Ret == RK_SUCCESS) {
             void *pData = RK_MPI_MB_Handle2VirAddr(stFrame_.pstPack->pMbBlk);
-            rtsp_tx_video(g_rtsp_session_, (uint8_t *)pData, 
-                         stFrame_.pstPack->u32Len, stFrame_.pstPack->u64PTS);
-            rtsp_do_event(g_rtsplive_);
+            if (pData && stFrame_.pstPack->u32Len) {
+                if (g_rtsplive_ && g_rtsp_session_) {
+                    rtsp_tx_video(g_rtsp_session_, (uint8_t *)pData,
+                                  stFrame_.pstPack->u32Len, stFrame_.pstPack->u64PTS);
+                    rtsp_do_event(g_rtsplive_);
+                }
+                recording_.enqueue(pData, stFrame_.pstPack->u32Len, stFrame_.pstPack->u64PTS);
+            }
+        } else {
+            fprintf(stderr, "[Video] VENC GetStream 失败: %d\n", s32Ret);
         }
         
 #ifdef ENABLE_PERFORMANCE_TIMING
@@ -1157,7 +1180,7 @@ void Video::encodeLoop() {
         }
 #endif
         
-        RK_MPI_VENC_ReleaseStream(0, &stFrame_);
+        if (s32Ret == RK_SUCCESS) RK_MPI_VENC_ReleaseStream(0, &stFrame_);
     }
     
     printf("[编码线程] 退出\n");
@@ -1336,5 +1359,3 @@ std::string Video::buildDetectionSummary() {
     
     return oss.str();
 }
-
-

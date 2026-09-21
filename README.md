@@ -55,7 +55,7 @@
   - **RGA 转换加速**：使用 RGA 硬件进行图像格式转换 (NV12->RGB888) 与自动缩放插络，零 CPU 消耗完成预处理。
   - **NPU 智能推理**：RKNN 提供底层 AI 算力。
   - **VPU 硬件编码**：对叠加了检测框后的最终画面进行 H.264 硬件视频编码。
-  - 最终实现 **从 1920x1080 图像采集、推理、OSD 绘制到编码、RTSP 推流全流程，稳定达到 30FPS** 的卓越性能。
+  - 当前直播与录像共用 **1280×720、30 fps、H.264 8 Mbit/s** 编码配置；实际帧率和录像稳定性需在设备上验证。
 
 - **🎯 实时多目标检测 (AI 智能分析)**：
   - 基于 YOLOv5 算法和 Rockchip NPU (RKNN) 硬件加速，支持高达 80 种 COCO 类别目标的实时检测。
@@ -84,7 +84,7 @@
 
 - **开发工具**：[Visual Studio Code](https://code.visualstudio.com/) + **Remote - SSH** 插件
 - **操作系统**：推荐在 **Windows (或 Mac) 上使用 WSL2 - Ubuntu 22.04** 作为编译服务器
-- **交叉编译链**：官方 Luckfox SDK (包含 arm-rockchip830-linux-uclibcgnueabihf 跨平台编译工具链)
+- **交叉编译链**：项目内 `toolchain/arm-rockchip830-linux-uclibcgnueabihf`，无需修改本机 SDK 路径
 - **构建系统**：CMake 3.10 及以上版本
 - **核心依赖库**：OpenCV 4.x、rknn_api 等
 
@@ -105,41 +105,54 @@ sudo apt-get install -y \
   openssh-client vim file cpio rsync curl
 ```
 
-### 2) 获取最新的 SDK
-```bash
-git clone https://gitee.com/LuckfoxTECH/luckfox-pico.git
-```
-
-### 3) 拉取本工程
+### 2) 拉取本工程
 ```bash
 git clone https://github.com/Tomorrow-star-618/Intelligent_Recognition_Client.git
 ```
 
-### 4) 进入代码并修改配置
-- 修改 CMake 文件的 SDK_PATH，将此处路径设置为你第 2 步获取的官方 SDK（luckfox-pico）路径：
-```cpp
-set(SDK_PATH "/home/mingxing/luckfox-pico")
-```
-- 修改 `run.sh`，将此处 IP 地址修改为你 RV1106 开发板的 IP 地址：
-```bash
-scp -r install/ root@192.168.1.130:/root
-```
-
-### 5) 编译并运行
-- 编译程序并将可执行程序传入开发板：
+### 3) 编译及部署
+交叉编译器、目标 sysroot、平台头文件和库随项目保存；不需要另外下载完整 Luckfox SDK。只编译并安装到项目的 `install/`：
 ```bash
 ./run.sh
 ```
-- 切换到 RV1106 开发板终端执行（设备将自动启动 UDP 发现和 RTSP 推流）：
+编译后同时传到指定开发板：
+```bash
+./run.sh 192.168.1.158
+```
+`run.sh` 使用 `build/portable/`，避开旧 `build/` 缓存中的原机器编译器路径。若手动运行 CMake，请使用新的构建目录。编译工具链约 233 MiB，需完整保留 `toolchain/` 目录和其中的符号链接。
+
+### 4) 在开发板运行
+切换到 RV1106 开发板终端执行（设备将自动启动 UDP 发现和 RTSP 推流）：
 ```bash
 cd /root/install
 ./Intelligent_Recognition_Client
 ```
-- 上位机启动 UDP 发现，找到设备后自动建立 TCP 连接进行通信。
+上位机启动 UDP 发现，找到设备后自动建立 TCP 连接进行通信。
 
 ---
 
 ## 🏗️ 框架设计
+
+### SD 卡连续录像（试用版）
+
+程序复用 RTSP 的 H.264 编码输出，在独立录像线程中封装为 MP4 并写入 SD 卡，不进行第二次编码。为保持原有直播参数，目前直播与录像共用 1280×720、30 fps、8 Mbit/s 编码参数，见 `code/modules/video/luckfox_mpi.h`。录像按关键帧切成约 60 秒的 `clip_开始时间_结束时间.mp4` 文件，例如 `clip_2026-09-21-11-20-00-123_2026-09-21-11-21-00-125.mp4`；写入中的文件使用 `.part` 后缀，正常关闭并写完索引后重命名。文件名时间为 UTC。此前生成的 `.h264` 文件仍参与空间和过期清理。MP4 封装使用项目内的 [minimp4](https://github.com/lieff/minimp4)（CC0），无需在板端安装 FFmpeg。Qt 时间轴与回放传输接口尚未接入。
+
+录像采用分片 MP4，持续写入可独立恢复的媒体片段，并默认每 10 秒同步到 SD 卡。异常断电或复位后，程序下次启动会扫描 `.part`，截掉未写完整的末尾，将剩余内容恢复并重命名为 `.mp4`。断电前尚未同步到 SD 卡的短暂末尾仍可能丢失。此前由普通 MP4 版本产生且没有索引的 `.part` 无法按此方式恢复。可在 PC 上用 `ffprobe 文件.mp4` 检查编码、帧率和时长，或直接用常见播放器打开。虚拟机生成的是 ARM/uClibc 可执行文件，需部署到开发板运行录像；不能在 x86 虚拟机直接运行主程序。
+
+Buildroot 根文件系统与录像共用 SD 卡，无需单独挂载 `/root/record`。程序会创建 `/root/record/recordings`，并按该分区的实际空闲空间和录像总量清理旧片段。启动前可设置以下环境变量：
+
+| 环境变量 | 默认值 | 含义 |
+|---|---:|---|
+| `IRC_RECORD_ROOT` | `/root/record` | 录像根目录，文件写入其 `recordings/` 子目录；旧变量 `IRC_RECORD_MOUNT` 仍可用 |
+| `IRC_RECORD_MAX_MB` | `4096` | 录像总量上限，单位 MiB |
+| `IRC_RECORD_MIN_FREE_MB` | `1024` | 根文件系统必须保留的空闲空间，单位 MiB |
+| `IRC_RECORD_MAX_AGE_DAYS` | `7` | 最长保留天数；`0` 代表不限时间 |
+| `IRC_RECORD_SEGMENT_SECONDS` | `60` | 片段目标长度；实际切换等待下一个关键帧 |
+| `IRC_RECORD_SYNC_SECONDS` | `10` | 分片 MP4 刷新到 SD 卡的间隔；数值越小，断电时可能丢失的末尾越短 |
+| `IRC_RECORD_QUEUE_MB` | `8` | 录像线程队列上限；写卡过慢时丢弃至下一个关键帧 |
+
+容量或保留时间达到阈值后，程序优先删除最旧的已完成片段；仍不足时暂停录像写入，直播继续运行。实际可录时长取决于根文件系统剩余空间；若能用满默认的 4 GiB 录像上限，按 8 Mbit/s 预计保存约 70 分钟。录像文件使用 UTC 命名，设备时间需正确设置。
+
 ```text
 [Camera/VI]
      │
@@ -197,6 +210,7 @@ Intelligent_Recognition_Client/
 │       └── servo/               # 舵机硬件控制 (PWM操作层)
 ├── include/                     # SDK头文件依赖 (RK 媒体接口、OpenCV等)
 ├── lib/                         # 平台预置库 (glibc/uclibc)
+├── toolchain/                   # 项目内置 RV1106/uClibc 交叉编译器及 sysroot
 ├── install/                     # cmake install 最终生成的部署目录
 └── docs/                        # 技术详细手册、协议说明
 ```

@@ -37,11 +37,11 @@
 // ==================== 性能调试开关 ====================
 #define ENABLE_PERFORMANCE_TIMING   // 开启各线程逐步耗时打印（30帧/次）
 // #define ENABLE_FPS_CONSOLE       // 开启终端 FPS 输出
-#define ENABLE_FPS_DISPLAY          // 开启画面右上角 FPS + 运行时间叠加显示
+#define ENABLE_FPS_DISPLAY          // 开启画面右上角北京时间 + FPS 叠加显示
 
 // ==================== 系统配置参数 ====================
-#define IMAGE_WIDTH           1920   // 采集/编码分辨率：宽（像素）
-#define IMAGE_HEIGHT          1080   // 采集/编码分辨率：高（像素）
+#define IMAGE_WIDTH           1280   // 采集/编码分辨率：宽（像素）
+#define IMAGE_HEIGHT          720   // 采集/编码分辨率：高（像素）
 #define MODEL_WIDTH           640   // YOLOv5 模型输入宽度
 #define MODEL_HEIGHT          640   // YOLOv5 模型输入高度
 #define INFERENCE_FRAME_SKIP  3     // 推理跳帧数：每 (N+1) 帧推理 1 次，3 → 每4帧推1次
@@ -66,6 +66,7 @@
 #include "luckfox_mpi.h"
 #include "yolov5.h"
 #include "common.h"
+#include "recording.h"
 
 // ==================== 前向声明 ====================
 class Control;
@@ -302,7 +303,7 @@ private:
     /**
      * @brief 编码推流循环（Thread4，~27fps）
      *
-     * 等待 bgr_buffer_.ready → OpenCV 绘制检测框/FPS/运行时间 →
+     * 等待 bgr_buffer_.ready → OpenCV 绘制检测框/北京时间/FPS →
      *   memcpy(frame_.data → VENC DMA MB) →
      *   RK_MPI_VENC_SendFrame → RK_MPI_VENC_GetStream → RTSP 推流
      * frame_ 为 RGB 字节序（CV_8UC3），Scalar(R,G,B) 通道顺序与 BGR Mat 相反。
@@ -384,6 +385,7 @@ private:
     // --- RTSP 推流 ---
     rtsp_demo_handle    g_rtsplive_;      // RTSP 服务器实例句柄
     rtsp_session_handle g_rtsp_session_;  // RTSP 会话句柄（/live/0）
+    Recording           recording_;       // SD 卡录像线程，复用 VENC 的 H.264 输出
 
     // --- 线程管理 ---
     pthread_t thread_capture_;     // 采集线程 tid
@@ -423,9 +425,6 @@ private:
     int            frame_count_;      // 当前统计周期内的编码帧数
     struct timeval fps_start_time_;   // 当前统计周期的起始时刻
     float          current_fps_;      // 最近一次计算得到的 FPS
-#endif
-#ifdef ENABLE_FPS_DISPLAY
-    struct timeval program_start_time_; // 程序启动时刻（计算累计运行时长）
 #endif
 };
 

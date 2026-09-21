@@ -25,6 +25,11 @@
 #define TEST_ARGB32_TRANS 0x00000000
 #define TEST_ARGB32_BLACK 0x000000FF
 
+// 直播和录像共用这一路 H.264 编码；调整后两者同时生效。
+#define VIDEO_SOURCE_FPS 30
+#define VIDEO_OUTPUT_FPS 30
+#define VIDEO_H264_BITRATE_KBPS (8 * 1024)
+
 
 RK_U64 TEST_COMM_GetNowUs();
 RK_S32 test_rgn_overlay_line_process(int sX ,int sY,int type, int group);

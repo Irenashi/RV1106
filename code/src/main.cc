@@ -18,11 +18,11 @@
 #include "tcp.h"
 #include "udp_discovery.h"
 
-bool quit = false;
+volatile sig_atomic_t quit = 0;
 
 static void sigterm_handler(int sig) {
-    fprintf(stderr, "Caught signal %d, cleaning up...\n", sig);
-    quit = true;
+    (void)sig;
+    quit = 1;
 }
 
 // 获取本机IP地址（优先获取eth0，其次wlan0）
@@ -66,9 +66,13 @@ int main(int argc, char *argv[])
     int model_width = MODEL_WIDTH;
     int model_height = MODEL_HEIGHT;
 
-    // 注册信号处理函数，捕获 SIGINT 和 SIGTERM
-    //signal(SIGINT, sigterm_handler);
-    signal(SIGTERM, sigterm_handler);
+    // Ctrl+C / SIGTERM 都走线程收尾流程，让正在写入的 .part 完成并改名。
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = sigterm_handler;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGINT, &action, NULL);
+    sigaction(SIGTERM, &action, NULL);
 
     // 初始化云台
     printf("开始云台初始化！\n");
@@ -78,10 +82,11 @@ int main(int argc, char *argv[])
     // 初始化并启动视频处理模块（不依赖TCP，优先启动）
     printf("开始视频初始化！\n");
     Video* g_video = new Video(width, height, model_width, model_height);
+    bool videoReady = false;
     if (g_video->init()) {
         printf("视频模块初始化成功！\n");
-        g_video->start();
-        printf("视频线程已自动启动\n");
+        videoReady = g_video->start();
+        printf(videoReady ? "视频线程已自动启动\n" : "视频线程启动失败！\n");
     } else {
         printf("视频模块初始化失败！\n");
     }
@@ -154,7 +159,8 @@ int main(int argc, char *argv[])
     printf("  quit                      - 退出程序\n");
     printf("===========================================\n");
     printf("服务状态：\n");
-    printf("  ✅ RTSP 推流      - rtsp://%s/live/0\n", localIp.c_str());
+    if (videoReady) printf("  ✅ RTSP 推流      - rtsp://%s/live/0\n", localIp.c_str());
+    else printf("  ❌ RTSP 推流未启动\n");
     printf("  ✅ UDP 发现服务   - 端口 8888\n");
     printf("  ✅ TCP 通信       - 等待上位机连接\n");
     printf("===========================================\n");
@@ -163,7 +169,14 @@ int main(int argc, char *argv[])
     {
         printf("> ");
         fflush(stdout);
-        if (fgets(cmd, sizeof(cmd), stdin) == NULL) break;
+        if (fgets(cmd, sizeof(cmd), stdin) == NULL) {
+            // Buildroot 后台服务通常没有标准输入；EOF 不代表要停止监控。
+            if (!quit && feof(stdin)) {
+                printf("标准输入已关闭，继续后台运行；发送 SIGTERM 可正常退出。\n");
+                while (!quit) sleep(1);
+            }
+            break;
+        }
         
         // 去除换行符
         cmd[strcspn(cmd, "\r\n")] = 0;

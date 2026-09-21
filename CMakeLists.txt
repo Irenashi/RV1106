@@ -4,13 +4,24 @@ cmake_minimum_required(VERSION 3.10)
 set(LIBC_TYPE "uclibc")
 message(STATUS "Using libc type: ${LIBC_TYPE}")
 
-# 设置SDK路径为固定值
-set(SDK_PATH "/home/mingxing/luckfox-pico")
-message(STATUS "Using SDK path: ${SDK_PATH}")
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR arm)
 
-# 设置uclibc的交叉编译器
-set(CMAKE_C_COMPILER "${SDK_PATH}/tools/linux/toolchain/arm-rockchip830-linux-uclibcgnueabihf/bin/arm-rockchip830-linux-uclibcgnueabihf-gcc")
-set(CMAKE_CXX_COMPILER "${SDK_PATH}/tools/linux/toolchain/arm-rockchip830-linux-uclibcgnueabihf/bin/arm-rockchip830-linux-uclibcgnueabihf-g++")
+# 原方案：使用外部 Luckfox SDK（需要时取消下方注释，并注释“当前方案”中的编译器设置）。
+# set(SDK_PATH "/home/mingxing/luckfox-pico")
+# message(STATUS "Using SDK path: ${SDK_PATH}")
+# set(CMAKE_C_COMPILER "${SDK_PATH}/tools/linux/toolchain/arm-rockchip830-linux-uclibcgnueabihf/bin/arm-rockchip830-linux-uclibcgnueabihf-gcc")
+# set(CMAKE_CXX_COMPILER "${SDK_PATH}/tools/linux/toolchain/arm-rockchip830-linux-uclibcgnueabihf/bin/arm-rockchip830-linux-uclibcgnueabihf-g++")
+
+# 当前方案：使用项目内置的 RV1106/uClibc 交叉工具链。
+set(TOOLCHAIN_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/toolchain/arm-rockchip830-linux-uclibcgnueabihf")
+set(TOOLCHAIN_PREFIX "${TOOLCHAIN_ROOT}/bin/arm-rockchip830-linux-uclibcgnueabihf-")
+if(NOT EXISTS "${TOOLCHAIN_PREFIX}gcc" OR NOT EXISTS "${TOOLCHAIN_PREFIX}g++")
+    message(FATAL_ERROR "项目内交叉工具链不完整: ${TOOLCHAIN_ROOT}")
+endif()
+set(CMAKE_C_COMPILER "${TOOLCHAIN_PREFIX}gcc")
+set(CMAKE_CXX_COMPILER "${TOOLCHAIN_PREFIX}g++")
+message(STATUS "Using project toolchain: ${TOOLCHAIN_ROOT}")
 
 # 固定项目名称和源代码目录
 set(PROJECT_NAME "Intelligent_Recognition_Client")
@@ -45,6 +56,7 @@ file(GLOB SRC_UDP_DISCOVERY "${EXAMPLE_DIR}/modules/udp_discovery/*.cc")  # UDP�
 file(GLOB SRC_MAIN "${EXAMPLE_DIR}/src/*.cc")
 # DMA缓冲区分配器（RGA硬件加速所需，提供dma_buf_alloc/dma_buf_free）
 set(SRC_DMA_ALLOC "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/allocator/dma/dma_alloc.cpp")
+set(SRC_MP4_MUX "${EXAMPLE_DIR}/modules/video/mp4_mux.c")
 
 set(SRC_FILES
     ${SRC_CONTROL}
@@ -54,6 +66,7 @@ set(SRC_FILES
     ${SRC_YOLO}
     ${SRC_UDP_DISCOVERY}  # 添加UDP发现模块
     ${SRC_DMA_ALLOC}      # DMA缓冲区分配器
+    ${SRC_MP4_MUX}        # 无外部运行时依赖的 MP4 封装器
     ${SRC_MAIN}
 )
 add_executable(${PROJECT_NAME} ${SRC_FILES})

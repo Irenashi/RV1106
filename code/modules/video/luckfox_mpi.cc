@@ -101,11 +101,11 @@ int venc_init(int chnId, int width, int height, RK_CODEC_ID_E enType) {
 
 	if (enType == RK_VIDEO_ID_AVC) {
 		stAttr.stRcAttr.enRcMode = VENC_RC_MODE_H264CBR;
-		stAttr.stRcAttr.stH264Cbr.u32BitRate = 8 * 1024; // 降低码率提高速度
-		stAttr.stRcAttr.stH264Cbr.u32Gop = 30; // 
-		stAttr.stRcAttr.stH264Cbr.u32SrcFrameRateNum = 30; // 设置源帧率
+		stAttr.stRcAttr.stH264Cbr.u32BitRate = VIDEO_H264_BITRATE_KBPS;
+		stAttr.stRcAttr.stH264Cbr.u32Gop = VIDEO_OUTPUT_FPS; // 每秒约一个关键帧，便于录像切片
+		stAttr.stRcAttr.stH264Cbr.u32SrcFrameRateNum = VIDEO_SOURCE_FPS;
 		stAttr.stRcAttr.stH264Cbr.u32SrcFrameRateDen = 1;
-		stAttr.stRcAttr.stH264Cbr.fr32DstFrameRateNum = 30; // 目标帧率
+		stAttr.stRcAttr.stH264Cbr.fr32DstFrameRateNum = VIDEO_OUTPUT_FPS;
 		stAttr.stRcAttr.stH264Cbr.fr32DstFrameRateDen = 1;
 	} else if (enType == RK_VIDEO_ID_HEVC) {
 		stAttr.stRcAttr.enRcMode = VENC_RC_MODE_H265CBR;
