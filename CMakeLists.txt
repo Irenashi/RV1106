@@ -50,6 +50,7 @@ find_package(Threads REQUIRED)
 file(GLOB SRC_CONTROL "${EXAMPLE_DIR}/modules/control/*.cc")
 file(GLOB SRC_SERVO "${EXAMPLE_DIR}/modules/servo/*.cc")
 file(GLOB SRC_TCP "${EXAMPLE_DIR}/modules/tcp/*.cc")
+file(GLOB SRC_HTTP "${EXAMPLE_DIR}/modules/http/*.cc")
 file(GLOB SRC_VIDEO "${EXAMPLE_DIR}/modules/video/*.cc")
 file(GLOB SRC_YOLO "${EXAMPLE_DIR}/modules/yolo/*.cc")
 file(GLOB SRC_UDP_DISCOVERY "${EXAMPLE_DIR}/modules/udp_discovery/*.cc")  # UDP发现模块
@@ -62,6 +63,7 @@ set(SRC_FILES
     ${SRC_CONTROL}
     ${SRC_SERVO}
     ${SRC_TCP}
+    ${SRC_HTTP}
     ${SRC_VIDEO}
     ${SRC_YOLO}
     ${SRC_UDP_DISCOVERY}  # 添加UDP发现模块
@@ -103,6 +105,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
                             ${EXAMPLE_DIR}/modules/control 
                             ${EXAMPLE_DIR}/modules/servo
                             ${EXAMPLE_DIR}/modules/tcp
+                            ${EXAMPLE_DIR}/modules/http
                             ${EXAMPLE_DIR}/modules/video
                             ${EXAMPLE_DIR}/modules/yolo
                             ${EXAMPLE_DIR}/modules/udp_discovery  # UDP发现模块头文件

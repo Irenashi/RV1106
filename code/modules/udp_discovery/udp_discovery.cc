@@ -23,6 +23,7 @@ UdpDiscovery::UdpDiscovery(const std::string& deviceId,
     , model_("RV1106")
     , firmwareVersion_("1.0.0")
     , rtspPort_(554)
+    , recordingHttpPort_(0)
     , status_(STATUS_ONLINE)
     , port_(port)
     , sockfd_(-1)
@@ -195,6 +196,12 @@ void UdpDiscovery::setFirmwareVersion(const std::string& version) {
 void UdpDiscovery::setRtspPort(int port) {
     pthread_mutex_lock(&mutex_);
     rtspPort_ = port;
+    pthread_mutex_unlock(&mutex_);
+}
+
+void UdpDiscovery::setRecordingHttpPort(int port) {
+    pthread_mutex_lock(&mutex_);
+    recordingHttpPort_ = port;
     pthread_mutex_unlock(&mutex_);
 }
 
@@ -447,10 +454,15 @@ std::string UdpDiscovery::buildDiscoveryResponse() {
         ",\"manufacturer\":\"%s\""
         ",\"model\":\"%s\""
         ",\"firmware_version\":\"%s\""
+        ",\"recording_playback\":%s"
+        ",\"recording_http_port\":%d"
+        ",\"recording_api\":\"http://%s:%d/api/v1\""
         "}",
         manufacturer_.c_str(),
         model_.c_str(),
-        firmwareVersion_.c_str());
+        firmwareVersion_.c_str(),
+        recordingHttpPort_ > 0 ? "true" : "false",
+        recordingHttpPort_, ipAddress_.c_str(), recordingHttpPort_);
     
     pthread_mutex_unlock(&mutex_);
     

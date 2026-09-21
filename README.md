@@ -135,23 +135,11 @@ cd /root/install
 
 ### SD 卡连续录像（试用版）
 
-程序复用 RTSP 的 H.264 编码输出，在独立录像线程中封装为 MP4 并写入 SD 卡，不进行第二次编码。为保持原有直播参数，目前直播与录像共用 1280×720、30 fps、8 Mbit/s 编码参数，见 `code/modules/video/luckfox_mpi.h`。录像按关键帧切成约 60 秒的 `clip_开始时间_结束时间.mp4` 文件，例如 `clip_2026-09-21-11-20-00-123_2026-09-21-11-21-00-125.mp4`；写入中的文件使用 `.part` 后缀，正常关闭并写完索引后重命名。文件名时间为 UTC。此前生成的 `.h264` 文件仍参与空间和过期清理。MP4 封装使用项目内的 [minimp4](https://github.com/lieff/minimp4)（CC0），无需在板端安装 FFmpeg。Qt 时间轴与回放传输接口尚未接入。
+程序复用 RTSP 的 H.264 编码数据，在独立线程中封装为分片 MP4 并保存到 `/root/record/recordings`，无需二次编码或在开发板安装 FFmpeg。录像默认按约 60 秒切片，并根据容量、剩余空间和保留时间自动清理旧文件。
 
-录像采用分片 MP4，持续写入可独立恢复的媒体片段，并默认每 10 秒同步到 SD 卡。异常断电或复位后，程序下次启动会扫描 `.part`，截掉未写完整的末尾，将剩余内容恢复并重命名为 `.mp4`。断电前尚未同步到 SD 卡的短暂末尾仍可能丢失。此前由普通 MP4 版本产生且没有索引的 `.part` 无法按此方式恢复。可在 PC 上用 `ffprobe 文件.mp4` 检查编码、帧率和时长，或直接用常见播放器打开。虚拟机生成的是 ARM/uClibc 可执行文件，需部署到开发板运行录像；不能在 x86 虚拟机直接运行主程序。
+录像数据定期同步到 SD 卡；意外断电或复位后，程序会在下次启动时恢复可用的 `.part` 文件。存储目录、容量限制、保留时间、切片时长和同步间隔均可通过环境变量配置。
 
-Buildroot 根文件系统与录像共用 SD 卡，无需单独挂载 `/root/record`。程序会创建 `/root/record/recordings`，并按该分区的实际空闲空间和录像总量清理旧片段。启动前可设置以下环境变量：
-
-| 环境变量 | 默认值 | 含义 |
-|---|---:|---|
-| `IRC_RECORD_ROOT` | `/root/record` | 录像根目录，文件写入其 `recordings/` 子目录；旧变量 `IRC_RECORD_MOUNT` 仍可用 |
-| `IRC_RECORD_MAX_MB` | `4096` | 录像总量上限，单位 MiB |
-| `IRC_RECORD_MIN_FREE_MB` | `1024` | 根文件系统必须保留的空闲空间，单位 MiB |
-| `IRC_RECORD_MAX_AGE_DAYS` | `7` | 最长保留天数；`0` 代表不限时间 |
-| `IRC_RECORD_SEGMENT_SECONDS` | `60` | 片段目标长度；实际切换等待下一个关键帧 |
-| `IRC_RECORD_SYNC_SECONDS` | `10` | 分片 MP4 刷新到 SD 卡的间隔；数值越小，断电时可能丢失的末尾越短 |
-| `IRC_RECORD_QUEUE_MB` | `8` | 录像线程队列上限；写卡过慢时丢弃至下一个关键帧 |
-
-容量或保留时间达到阈值后，程序优先删除最旧的已完成片段；仍不足时暂停录像写入，直播继续运行。实际可录时长取决于根文件系统剩余空间；若能用满默认的 4 GiB 录像上限，按 8 Mbit/s 预计保存约 70 分钟。录像文件使用 UTC 命名，设备时间需正确设置。
+开发板通过默认端口 `18080` 提供录像列表和支持 HTTP Range 的 MP4 文件接口，Qt 上位机已完成录像查询、播放和进度跳转适配。接口说明见 [`docs/RECORDING_HTTP_API.md`](docs/RECORDING_HTTP_API.md)。
 
 ```text
 [Camera/VI]
@@ -206,6 +194,7 @@ Intelligent_Recognition_Client/
 │       ├── yolo/                # AI推理算法：RKNN YOLOv5 推理及 NMS 后处理
 │       ├── tcp/                 # TCP 网络客户端 (心跳保活、断线重连)
 │       ├── udp_discovery/       # UDP 设备发现服务 (8888端口广播响应)
+│       ├── http/                # 录像列表与 MP4 Range 回放服务
 │       ├── control/             # 业务主控中心 (调度TCP、聚合报警数据)
 │       └── servo/               # 舵机硬件控制 (PWM操作层)
 ├── include/                     # SDK头文件依赖 (RK 媒体接口、OpenCV等)

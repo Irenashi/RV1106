@@ -68,6 +68,7 @@ public:
     void setModel(const std::string& model);
     void setFirmwareVersion(const std::string& version);
     void setRtspPort(int port);
+    void setRecordingHttpPort(int port);
     
     // 设置上位机发现回调函数
     // 当收到上位机的discovery_request时会调用此回调
@@ -111,6 +112,7 @@ private:
     std::string model_;
     std::string firmwareVersion_;
     int rtspPort_;
+    int recordingHttpPort_;
     DeviceStatus status_;
     
     // 网络配置

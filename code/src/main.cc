@@ -17,6 +17,7 @@
 #include "video.h"
 #include "tcp.h"
 #include "udp_discovery.h"
+#include "recording_http_server.h"
 
 volatile sig_atomic_t quit = 0;
 
@@ -73,6 +74,7 @@ int main(int argc, char *argv[])
     sigemptyset(&action.sa_mask);
     sigaction(SIGINT, &action, NULL);
     sigaction(SIGTERM, &action, NULL);
+    signal(SIGPIPE, SIG_IGN);
 
     // 初始化云台
     printf("开始云台初始化！\n");
@@ -107,12 +109,19 @@ int main(int argc, char *argv[])
     std::string localIp = getLocalIP();
     std::string rtspUrl = "rtsp://" + localIp + "/live/0";
     printf("本机IP: %s, RTSP URL: %s\n", localIp.c_str(), rtspUrl.c_str());
+
+    // 录像回放使用独立 HTTP 服务，支持列表查询和 MP4 Range 读取。
+    RecordingHttpServer* g_recording_http = new RecordingHttpServer();
+    const bool recordingHttpReady = g_recording_http->start();
+    if (!recordingHttpReady)
+        printf("❌ 录像回放 HTTP 服务启动失败，直播和录像写入不受影响\n");
     
     UdpDiscovery* g_udp = new UdpDiscovery(deviceId, deviceName, rtspUrl);
     g_udp->setIpAddress(localIp);  // 设置设备IP，以便在发现响应中返回
     g_udp->setManufacturer("Luckfox");
     g_udp->setModel("RV1106-Smart");
     g_udp->setFirmwareVersion("1.0.0");
+    g_udp->setRecordingHttpPort(recordingHttpReady ? g_recording_http->port() : 0);
     
     // 设置连接请求回调，只有收到connection_request时才建立TCP连接
     // discovery_request只会响应设备信息，不会触发此回调
@@ -163,6 +172,11 @@ int main(int argc, char *argv[])
     else printf("  ❌ RTSP 推流未启动\n");
     printf("  ✅ UDP 发现服务   - 端口 8888\n");
     printf("  ✅ TCP 通信       - 等待上位机连接\n");
+    if (recordingHttpReady)
+        printf("  ✅ 录像回放 HTTP  - http://%s:%d/api/v1/recordings\n",
+               localIp.c_str(), g_recording_http->port());
+    else
+        printf("  ❌ 录像回放 HTTP  - 未启动\n");
     printf("===========================================\n");
     
     while (!quit)
@@ -195,6 +209,10 @@ int main(int argc, char *argv[])
             }
         }
     }
+    printf("正在停止录像回放 HTTP 服务...\n");
+    g_recording_http->stop();
+    printf("录像回放 HTTP 服务已停止\n");
+
 	// 等待视频线程和TCP线程结束
     printf("正在停止视频线程...\n");
     g_video->stop();
@@ -226,6 +244,12 @@ int main(int argc, char *argv[])
         delete g_udp;
         g_udp = nullptr;
         printf("UDP发现模块已清理\n");
+    }
+
+    if (g_recording_http) {
+        delete g_recording_http;
+        g_recording_http = nullptr;
+        printf("录像回放 HTTP 模块已清理\n");
     }
 
     if (g_video) {
