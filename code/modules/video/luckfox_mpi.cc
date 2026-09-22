@@ -70,7 +70,9 @@ int vi_dev_init() {
 // 初始化视频输入通道（VI Channel），设置分辨率、格式、缓冲等
 int vi_chn_init(int channelId, int width, int height) {
 	int ret;
-	int buf_cnt = 3; // 增加缓冲区数量，提高吞吐
+	// 1080p 下每个 NV12 帧约 3 MiB。使用官方示例的双缓冲，
+	// 避免与 RGB 三缓冲、VENC 和 NPU 争用有限的媒体连续内存。
+	int buf_cnt = 2;
 	// VI init
 	VI_CHN_ATTR_S vi_chn_attr;
 	memset(&vi_chn_attr, 0, sizeof(vi_chn_attr));
@@ -119,20 +121,32 @@ int venc_init(int chnId, int width, int height, RK_CODEC_ID_E enType) {
 	stAttr.stVencAttr.enType = enType;
 	stAttr.stVencAttr.enPixelFormat = RK_FMT_RGB888;
 	if (enType == RK_VIDEO_ID_AVC)
-		stAttr.stVencAttr.u32Profile = H264E_PROFILE_BASELINE; // 改用Baseline更快
+		stAttr.stVencAttr.u32Profile = H264E_PROFILE_HIGH;
 	stAttr.stVencAttr.u32PicWidth = width;
 	stAttr.stVencAttr.u32PicHeight = height;
+	// RV1106 RK_MPI 的 RGB888 示例要求 VENC 虚拟尺寸与有效尺寸一致。
+	// VI/RGA 的行步长由上游缓冲单独处理，不能在这里把 1080 改成 1088。
 	stAttr.stVencAttr.u32VirWidth = width;
 	stAttr.stVencAttr.u32VirHeight = height;
-	stAttr.stVencAttr.u32StreamBufCnt = 4; // 增加缓冲
+	// Luckfox 官方 1920x1080 RGB888 示例使用两个码流缓冲。
+	stAttr.stVencAttr.u32StreamBufCnt = 2;
 	stAttr.stVencAttr.u32BufSize = width * height * 3 / 2;
 	stAttr.stVencAttr.enMirror = MIRROR_NONE;
 
-	RK_MPI_VENC_CreateChn(chnId, &stAttr);
+	RK_S32 ret = RK_MPI_VENC_CreateChn(chnId, &stAttr);
+	if (ret != RK_SUCCESS) {
+		printf("RK_MPI_VENC_CreateChn failed: %#x\n", ret);
+		return ret;
+	}
 
 	memset(&stRecvParam, 0, sizeof(VENC_RECV_PIC_PARAM_S));
 	stRecvParam.s32RecvPicNum = -1;
-	RK_MPI_VENC_StartRecvFrame(chnId, &stRecvParam);
+	ret = RK_MPI_VENC_StartRecvFrame(chnId, &stRecvParam);
+	if (ret != RK_SUCCESS) {
+		printf("RK_MPI_VENC_StartRecvFrame failed: %#x\n", ret);
+		RK_MPI_VENC_DestroyChn(chnId);
+		return ret;
+	}
 
-	return 0;
+	return RK_SUCCESS;
 }

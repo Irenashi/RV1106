@@ -14,12 +14,16 @@ struct MP4E_mux_tag;
 // 所有磁盘操作只在录像线程进行；编码线程只复制数据到有上限的队列。
 class Recording {
 public:
+    typedef void (*PerformanceLogCallback)(bool ai_enabled, const char* message,
+                                           void* user_data);
+
     Recording(int width, int height);
     ~Recording();
 
     bool start();
     void stop();
-    void enqueue(const void* data, size_t size, uint64_t pts);
+    void enqueue(const void* data, size_t size, uint64_t pts, bool ai_enabled);
+    void setPerformanceLogCallback(PerformanceLogCallback callback, void* user_data);
 
 private:
     struct Packet {
@@ -28,6 +32,7 @@ private:
         uint64_t wall_ms;
         bool idr;
         bool discontinuity;
+        bool ai_enabled;
     };
 
     static void* threadEntry(void* arg);
@@ -73,6 +78,8 @@ private:
     uint64_t last_sync_ms_;
     uint64_t interval_mux_us_;
     uint64_t interval_mux_samples_;
+    PerformanceLogCallback performance_log_callback_;
+    void* performance_log_user_data_;
     std::vector<unsigned char> sps_;
     std::vector<unsigned char> pps_;
 };

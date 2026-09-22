@@ -1,22 +1,24 @@
 /**
  * @file video.cc
- * @brief 视频处理模块实现 —— 四线程异步硬件加速流水线
+ * @brief 视频处理模块实现 —— 四线程视频流水线 + 独立录像线程
  *
- * 线程职责与性能指标：
+ * 线程职责与性能指标（1920x1080，2026-09-23 实测）：
  * ┌───────────┬──────────────────────────────────────────┬──────────┐
  * │ 线程       │ 工作内容                                  │ 目标帧率 │
  * ├───────────┼──────────────────────────────────────────┼──────────┤
  * │ Thread1   │ VI → memcpy(NV12→DMA)                    │ 30fps    │
  * │ captureLoop│                                         │          │
  * ├───────────┼──────────────────────────────────────────┼──────────┤
- * │ Thread2   │ RGA NV12→RGB(<5ms) + 三缓冲轮换           │ ≈27fps   │
+ * │ Thread2   │ RGA NV12→RGB(约4–6ms) + 三缓冲轮换        │ 30fps    │
  * │ bgrConvert│ [替代 CPU cvtColor ~32ms]                 │          │
  * ├───────────┼──────────────────────────────────────────┼──────────┤
- * │ Thread3   │ RGA letterbox(<3ms) + RKNN YOLOv5(~96ms) │ ≈6fps    │
+ * │ Thread3   │ letterbox+拷贝(约5–12ms) + RKNN(约117ms) │ ≈7.5fps  │
  * │ inference │ 每(INFERENCE_FRAME_SKIP+1)帧推理1次       │          │
  * ├───────────┼──────────────────────────────────────────┼──────────┤
- * │ Thread4   │ OpenCV绘制 + memcpy + VENC H.264 + RTSP  │ ≈27fps   │
- * │ encodeLoop│                                          │          │
+ * │ Thread4   │ OpenCV绘制 + VENC H.264                  │ 26–30fps │
+ * │ encodeLoop│ → RTSP + Recording队列                   │          │
+ * ├───────────┼──────────────────────────────────────────┼──────────┤
+ * │ Recording │ H.264→分片MP4→SD卡，同步/清理/断电恢复   │ 异步     │
  * └───────────┴──────────────────────────────────────────┴──────────┘
  *
  * RGA 使用约束（RV1106 RGA2）：
@@ -40,8 +42,17 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <time.h>
+#include <stdarg.h>
+#include <errno.h>
+#include <sys/stat.h>
 #include <sstream>
 #include <iomanip>
+
+namespace {
+int align16(int value) {
+    return (value + 15) & ~15;
+}
+}
 
 // 网络库
 #include <sys/socket.h>
@@ -71,12 +82,13 @@
  *   Mat 析构时不会 free data（data 生命周期由 dma_buf_free 管理）。
  */
 Video::Video(int width, int height, int model_width, int model_height)
-    : width_(width), height_(height), 
+    : width_(width), height_(height),
+      vir_width_(align16(width)), vir_height_(align16(height)),
       model_width_(model_width), model_height_(model_height),
       H264_TimeRef_(0), 
       g_rtsplive_(NULL), g_rtsp_session_(NULL), 
       recording_(width, height),
-      running_(false), 
+      running_(false), resources_released_(false),
       ai_enable_(false), area_enable_(false), obj_enable_(false), 
       control_(nullptr), 
       last_send_time_(0), send_interval_(DEFAULT_SEND_INTERVAL),
@@ -91,13 +103,19 @@ Video::Video(int width, int height, int model_width, int model_height)
     
     // 初始化上下文和时间戳
     memset(&rknn_app_ctx_, 0, sizeof(rknn_app_context_t));
+    memset(&stFrame_, 0, sizeof(stFrame_));
+    memset(&stViFrame_, 0, sizeof(stViFrame_));
+    memset(&h264_frame_, 0, sizeof(h264_frame_));
+    src_Pool_ = MB_INVALID_POOLID;
+    src_Blk_ = MB_INVALID_HANDLE;
+    data_ = nullptr;
 #if defined(ENABLE_FPS_CONSOLE) || defined(ENABLE_FPS_DISPLAY)
     memset(&fps_start_time_, 0, sizeof(struct timeval));
 #endif
 
     // ===== DMA 内存分配（RGA 硬件加速必须使用 DMA buf）=====
     // 分配 YUV 缓冲区（采集→BGR转换，NV12格式）
-    int yuv_size = width_ * height_ * 3 / 2;
+    const size_t yuv_size = static_cast<size_t>(vir_width_) * vir_height_ * 3 / 2;
     capture_buffer_.dma.size = yuv_size;
     if (dma_buf_alloc(RV1106_CMA_HEAP_PATH, yuv_size,
                       &capture_buffer_.dma.fd,
@@ -112,7 +130,7 @@ Video::Video(int width, int height, int model_width, int model_height)
     pthread_cond_init(&capture_buffer_.cond, NULL);
 
     // 分配 BGR 三缓冲区（BGR转换→编码，DMA内存，RGA直接写入）
-    int bgr_size = width_ * height_ * 3;
+    const size_t bgr_size = static_cast<size_t>(vir_width_) * vir_height_ * 3;
     auto alloc_bgr_dma = [&](DmaBuf& dma) {
         dma.size = bgr_size;
         if (dma_buf_alloc(RV1106_CMA_HEAP_PATH, bgr_size, &dma.fd, &dma.va) < 0)
@@ -122,9 +140,13 @@ Video::Video(int width, int height, int model_width, int model_height)
     alloc_bgr_dma(bgr_buffer_.dma_ready);
     alloc_bgr_dma(bgr_buffer_.dma_read);
     // 封装成 cv::Mat（data 指向 DMA va，CPU可直接读写）
-    bgr_buffer_.bgr_write = new cv::Mat(height_, width_, CV_8UC3, bgr_buffer_.dma_write.va);
-    bgr_buffer_.bgr_ready = new cv::Mat(height_, width_, CV_8UC3, bgr_buffer_.dma_ready.va);
-    bgr_buffer_.bgr_read  = new cv::Mat(height_, width_, CV_8UC3, bgr_buffer_.dma_read.va);
+    const size_t rgb_step = static_cast<size_t>(vir_width_) * 3;
+    bgr_buffer_.bgr_write = new cv::Mat(height_, width_, CV_8UC3,
+                                        bgr_buffer_.dma_write.va, rgb_step);
+    bgr_buffer_.bgr_ready = new cv::Mat(height_, width_, CV_8UC3,
+                                        bgr_buffer_.dma_ready.va, rgb_step);
+    bgr_buffer_.bgr_read  = new cv::Mat(height_, width_, CV_8UC3,
+                                        bgr_buffer_.dma_read.va, rgb_step);
     bgr_buffer_.ready = false;
     bgr_buffer_.frame_index = 0;
     bgr_buffer_.timestamp = 0;
@@ -141,6 +163,116 @@ Video::Video(int width, int height, int model_width, int model_height)
     
     // 检测结果互斥锁
     pthread_mutex_init(&detection_mutex_, NULL);
+
+    performance_ai_on_file_ = nullptr;
+    performance_ai_off_file_ = nullptr;
+    pthread_mutex_init(&performance_log_mutex_, nullptr);
+    const char* configured_log_dir = getenv("IRC_PERFORMANCE_LOG_DIR");
+    if (configured_log_dir && configured_log_dir[0] == '/') {
+        performance_log_directory_ = configured_log_dir;
+    } else {
+        const char* record_root = getenv("IRC_RECORD_ROOT");
+        if (!record_root) record_root = getenv("IRC_RECORD_MOUNT");
+        performance_log_directory_ = std::string(record_root ? record_root : "/root/record") +
+                                     "/logs";
+    }
+    const time_t session_seconds = time(nullptr) + 8 * 60 * 60;
+    struct tm session_time;
+    char session_name[32] = "unknown_time";
+    if (gmtime_r(&session_seconds, &session_time))
+        strftime(session_name, sizeof(session_name), "%Y-%m-%d-%H-%M-%S", &session_time);
+    performance_session_name_ = session_name;
+    recording_.setPerformanceLogCallback(recordingPerformanceLog, this);
+}
+
+void Video::recordingPerformanceLog(bool ai_enabled, const char* message,
+                                    void* user_data) {
+    Video* video = static_cast<Video*>(user_data);
+    if (video) video->performanceLog(ai_enabled, "%s", message ? message : "");
+}
+
+FILE* Video::openPerformanceLog(bool ai_enabled) {
+#ifdef ENABLE_PERFORMANCE_FILE
+    FILE*& file = ai_enabled ? performance_ai_on_file_ : performance_ai_off_file_;
+    if (file) return file;
+    const size_t slash = performance_log_directory_.find_last_of('/');
+    if (slash != std::string::npos && slash > 0) {
+        const std::string parent = performance_log_directory_.substr(0, slash);
+        if (mkdir(parent.c_str(), 0755) != 0 && errno != EEXIST) return nullptr;
+    }
+    if (mkdir(performance_log_directory_.c_str(), 0755) != 0 && errno != EEXIST)
+        return nullptr;
+    const std::string path = performance_log_directory_ + "/performance_" +
+                             performance_session_name_ +
+                             (ai_enabled ? "_AI_ON.txt" : "_AI_OFF.txt");
+    file = fopen(path.c_str(), "a");
+    if (file) {
+        fprintf(file, "# session=%s mode=%s resolution=%dx%d pid=%d\n",
+                performance_session_name_.c_str(), ai_enabled ? "AI_ON" : "AI_OFF",
+                width_, height_, static_cast<int>(getpid()));
+        fflush(file);
+        printf("[性能日志] %s\n", path.c_str());
+    } else {
+        fprintf(stderr, "[性能日志] 无法打开 %s: %s\n", path.c_str(), strerror(errno));
+    }
+    return file;
+#else
+    (void)ai_enabled;
+    return nullptr;
+#endif
+}
+
+void Video::performanceLog(bool ai_enabled, const char* format, ...) {
+#ifdef ENABLE_PERFORMANCE_TIMING
+    char message[512];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(message, sizeof(message), format, args);
+    va_end(args);
+
+    pthread_mutex_lock(&performance_log_mutex_);
+#ifdef ENABLE_PERFORMANCE_CONSOLE
+    printf("%s\n", message);
+    fflush(stdout);
+#endif
+#ifdef ENABLE_PERFORMANCE_FILE
+    FILE* file = openPerformanceLog(ai_enabled);
+    if (file) {
+        struct timeval now;
+        gettimeofday(&now, nullptr);
+        const time_t beijing_seconds = now.tv_sec + 8 * 60 * 60;
+        struct tm beijing_time;
+        char timestamp[40] = "unknown_time";
+        if (gmtime_r(&beijing_seconds, &beijing_time)) {
+            const size_t length = strftime(timestamp, sizeof(timestamp),
+                                           "%Y-%m-%d %H:%M:%S", &beijing_time);
+            if (length && length + 5 < sizeof(timestamp))
+                snprintf(timestamp + length, sizeof(timestamp) - length,
+                         ".%03ld", static_cast<long>(now.tv_usec / 1000));
+        }
+        fprintf(file, "[%s][%s] %s\n", timestamp,
+                ai_enabled ? "AI_ON" : "AI_OFF", message);
+        fflush(file);
+    }
+#endif
+    pthread_mutex_unlock(&performance_log_mutex_);
+#else
+    (void)ai_enabled;
+    (void)format;
+#endif
+}
+
+void Video::closePerformanceLogs() {
+    pthread_mutex_lock(&performance_log_mutex_);
+    if (performance_ai_on_file_) {
+        fclose(performance_ai_on_file_);
+        performance_ai_on_file_ = nullptr;
+    }
+    if (performance_ai_off_file_) {
+        fclose(performance_ai_off_file_);
+        performance_ai_off_file_ = nullptr;
+    }
+    pthread_mutex_unlock(&performance_log_mutex_);
 }
 
 /**
@@ -157,6 +289,8 @@ Video::Video(int width, int height, int model_width, int model_height)
  */
 Video::~Video() {
     stop();
+    closePerformanceLogs();
+    pthread_mutex_destroy(&performance_log_mutex_);
     
     // 销毁互斥锁
     pthread_mutex_destroy(&capture_buffer_.mutex);
@@ -206,6 +340,22 @@ bool Video::init() {
     // 1. 停止可能占用资源的进程
     system("RkLunch-stop.sh");
     
+    if (width_ <= 0 || height_ <= 0 || (width_ & 1) || (height_ & 1)) {
+        fprintf(stderr, "[Video] 无效分辨率 %dx%d：NV12宽高必须为正偶数\n",
+                width_, height_);
+        return false;
+    }
+    if (capture_buffer_.dma.fd < 0 || !capture_buffer_.dma.va ||
+        bgr_buffer_.dma_write.fd < 0 || !bgr_buffer_.dma_write.va ||
+        bgr_buffer_.dma_ready.fd < 0 || !bgr_buffer_.dma_ready.va ||
+        bgr_buffer_.dma_read.fd < 0 || !bgr_buffer_.dma_read.va) {
+        fprintf(stderr, "[Video] DMA缓冲分配失败，分辨率 %dx%d，VI/RGA步长 %dx%d\n",
+                width_, height_, vir_width_, vir_height_);
+        return false;
+    }
+    printf("[Video] 分辨率: 编码 %dx%d, VI/RGA内部步长 %dx%d\n",
+           width_, height_, vir_width_, vir_height_);
+
     // 2. 加载YOLO模型
     const char *model_path = "./model/yolov5.rknn";
     if (init_yolov5_model(model_path, &rknn_app_ctx_) != 0) {
@@ -220,12 +370,23 @@ bool Video::init() {
     
     MB_POOL_CONFIG_S PoolCfg;
     memset(&PoolCfg, 0, sizeof(MB_POOL_CONFIG_S));
-    PoolCfg.u64MBSize = width_ * height_ * 3;
+    // VENC 的 RGB888 输入按有效尺寸紧凑存放。RV1106 的 RK_MPI VENC
+    // 不接受将 1920x1080 的 u32VirHeight 手动改成 1088。
+    const size_t venc_frame_size = static_cast<size_t>(width_) * height_ * 3;
+    PoolCfg.u64MBSize = venc_frame_size;
     PoolCfg.u32MBCnt = 1;
     PoolCfg.enAllocType = MB_ALLOC_TYPE_DMA;
     
     src_Pool_ = RK_MPI_MB_CreatePool(&PoolCfg);
-    src_Blk_ = RK_MPI_MB_GetMB(src_Pool_, width_ * height_ * 3, RK_TRUE);
+    if (src_Pool_ == MB_INVALID_POOLID) {
+        fprintf(stderr, "[Video] VENC输入内存池创建失败\n");
+        return false;
+    }
+    src_Blk_ = RK_MPI_MB_GetMB(src_Pool_, venc_frame_size, RK_TRUE);
+    if (src_Blk_ == MB_INVALID_HANDLE) {
+        fprintf(stderr, "[Video] VENC输入内存分配失败: %zu bytes\n", venc_frame_size);
+        return false;
+    }
     
     h264_frame_.stVFrame.u32Width = width_;
     h264_frame_.stVFrame.u32Height = height_;
@@ -236,7 +397,12 @@ bool Video::init() {
     h264_frame_.stVFrame.pMbBlk = src_Blk_;
     
     data_ = (unsigned char *)RK_MPI_MB_Handle2VirAddr(src_Blk_);
-    frame_ = cv::Mat(cv::Size(width_, height_), CV_8UC3, data_);
+    if (!data_) {
+        fprintf(stderr, "[Video] VENC输入内存映射失败\n");
+        return false;
+    }
+    memset(data_, 0, venc_frame_size);
+    frame_ = cv::Mat(height_, width_, CV_8UC3, data_);
     printf("[Video] ✅ 编码帧结构初始化成功\n");
 
     // 4. ISP初始化
@@ -270,13 +436,22 @@ bool Video::init() {
     printf("[Video] ✅ RTSP服务器初始化成功（端口554）\n");
     
     // 7. VI（视频输入）初始化
-    vi_dev_init();
-    vi_chn_init(0, width_, height_);
+    if (vi_dev_init() != RK_SUCCESS) {
+        fprintf(stderr, "[Video] ❌ VI设备初始化失败\n");
+        return false;
+    }
+    if (vi_chn_init(0, width_, height_) != RK_SUCCESS) {
+        fprintf(stderr, "[Video] ❌ VI视频输入初始化失败\n");
+        return false;
+    }
     printf("[Video] ✅ VI视频输入初始化成功\n");
     
     // 8. VENC（视频编码）初始化
     RK_CODEC_ID_E enCodecType = RK_VIDEO_ID_AVC;
-    venc_init(0, width_, height_, enCodecType);
+    if (venc_init(0, width_, height_, enCodecType) != RK_SUCCESS) {
+        fprintf(stderr, "[Video] ❌ VENC视频编码初始化失败\n");
+        return false;
+    }
     printf("[Video] ✅ VENC视频编码初始化成功\n");
     
     // 9. RGA缓冲区注册（硬件加速YUV→BGR使用）
@@ -329,6 +504,8 @@ bool Video::start() {
  * @brief 停止所有线程并释放硬件资源
  */
 void Video::stop() {
+    if (resources_released_) return;
+    resources_released_ = true;
     running_ = false;
 
     // 唤醒可能阻塞在条件变量上的线程，确保可及时退出
@@ -364,16 +541,29 @@ void Video::stop() {
     recording_.stop();
     
     // 释放硬件资源
-    RK_MPI_MB_ReleaseMB(src_Blk_);
-    RK_MPI_MB_DestroyPool(src_Pool_);
+    if (src_Blk_ != MB_INVALID_HANDLE) {
+        RK_MPI_MB_ReleaseMB(src_Blk_);
+        src_Blk_ = MB_INVALID_HANDLE;
+    }
+    if (src_Pool_ != MB_INVALID_POOLID) {
+        RK_MPI_MB_DestroyPool(src_Pool_);
+        src_Pool_ = MB_INVALID_POOLID;
+    }
     RK_MPI_VI_DisableChn(0, 0);
     RK_MPI_VI_DisableDev(0);
     SAMPLE_COMM_ISP_Stop(0);
     RK_MPI_VENC_StopRecvFrame(0);
     RK_MPI_VENC_DestroyChn(0);
     
-    if(stFrame_.pstPack) free(stFrame_.pstPack);
-    if(g_rtsplive_) rtsp_del_demo(g_rtsplive_);
+    if (stFrame_.pstPack) {
+        free(stFrame_.pstPack);
+        stFrame_.pstPack = nullptr;
+    }
+    if (g_rtsplive_) {
+        rtsp_del_demo(g_rtsplive_);
+        g_rtsplive_ = nullptr;
+        g_rtsp_session_ = nullptr;
+    }
     
     // 释放RGA缓冲句柄
     releaseRgaBuffers();
@@ -514,14 +704,14 @@ void* Video::encodeThreadFunc(void* arg) {
 //  - 不检查 ready 标志，直接覆盖写入，保证采集实时性
 //  - BGR 转换线程消费速度较慢时会丢帧，属于设计预期行为
 //
-// 耗时分解（典型值）：
-//  - RK_MPI_VI_GetChnFrame：~30ms（硬件同步等待，占主要时间）
-//  - memcpy(900KB NV12)：~2ms（CPU，无法省去，因 VI 输出不是 CMA 内存）
-//  - 合计：~32ms → 30fps
+// 1080P 稳定段实测（2026-09-23）：
+//  - AI关：VI等待平均27.04ms，分行拷贝平均6.90ms，总计平均33.94ms
+//  - AI开：VI等待平均21.08ms，分行拷贝平均14.19ms，总计平均35.27ms
+//  - 耗时包含线程调度和内存带宽竞争，不可直接视为纯硬件处理时间
+//  - 每30帧记录一次实际耗时，不再使用固定经验值判断性能
 void Video::captureLoop() {
     RK_S32 s32Ret;
     int frame_counter = 0;
-    int yuv_size = width_ * height_ * 3 / 2;
     
 #ifdef ENABLE_PERFORMANCE_TIMING
     struct timeval t_start, t_end;
@@ -547,12 +737,31 @@ void Video::captureLoop() {
 #endif
         
         void *vi_data = RK_MPI_MB_Handle2VirAddr(stViFrame_.stVFrame.pMbBlk);
+        if (!vi_data) {
+            fprintf(stderr, "[采集线程] VI帧地址映射失败\n");
+            RK_MPI_VI_ReleaseChnFrame(0, 0, &stViFrame_);
+            continue;
+        }
         uint64_t timestamp = TEST_COMM_GetNowUs();
+
+        const int src_stride = stViFrame_.stVFrame.u32VirWidth >= static_cast<RK_U32>(width_)
+            ? static_cast<int>(stViFrame_.stVFrame.u32VirWidth) : width_;
+        const int src_vir_height = stViFrame_.stVFrame.u32VirHeight >= static_cast<RK_U32>(height_)
+            ? static_cast<int>(stViFrame_.stVFrame.u32VirHeight) : height_;
         
-        // 🔒 快速拷贝YUV到BGR转换缓冲区（每帧都要，~2ms，加锁保护）
+        // 🔒 分行拷贝YUV到BGR转换缓冲区（1080P实测约7–14ms，加锁保护）
         // 注意：不检查ready标志，直接覆盖，BGR转换线程会丢帧（保证采集30fps实时性）
         pthread_mutex_lock(&capture_buffer_.mutex);
-        memcpy(capture_buffer_.dma.va, vi_data, yuv_size);
+        unsigned char* dst_y = static_cast<unsigned char*>(capture_buffer_.dma.va);
+        const unsigned char* src_y = static_cast<const unsigned char*>(vi_data);
+        unsigned char* dst_uv = dst_y + static_cast<size_t>(vir_width_) * vir_height_;
+        const unsigned char* src_uv = src_y + static_cast<size_t>(src_stride) * src_vir_height;
+        for (int row = 0; row < height_; ++row)
+            memcpy(dst_y + static_cast<size_t>(row) * vir_width_,
+                   src_y + static_cast<size_t>(row) * src_stride, width_);
+        for (int row = 0; row < height_ / 2; ++row)
+            memcpy(dst_uv + static_cast<size_t>(row) * vir_width_,
+                   src_uv + static_cast<size_t>(row) * src_stride, width_);
         capture_buffer_.timestamp = timestamp;
         capture_buffer_.ready = true;
     pthread_cond_signal(&capture_buffer_.cond);  // 通知BGR转换线程有新帧
@@ -565,8 +774,9 @@ void Video::captureLoop() {
         
         // 每30帧打印一次
         if (frame_counter % 30 == 0) {
-            printf("[采集#%d] VI获取: %ld us, YUV拷贝: %ld us, 总计: %ld us\n", 
-                   frame_counter, vi_time_us, copy_time_us, total_time_us);
+            performanceLog(ai_enable_,
+                           "[采集#%d] VI获取: %ld us, YUV分行拷贝: %ld us, 总计: %ld us",
+                           frame_counter, vi_time_us, copy_time_us, total_time_us);
         }
 #endif
         
@@ -585,7 +795,7 @@ void Video::captureLoop() {
 //  wrapbuffer_fd(capture_buffer_.dma.fd, NV12) →
 //  imcvtcolor(BT.601 Full Range) →
 //  wrapbuffer_fd(bgr_buffer_.dma_write.fd, RGB888)
-//  耗时：<5ms（RGA 硬件，替代 CPU cvtColor 的 ~32ms）
+//  1080P实测：AI关平均4.07ms；AI开平均4.84ms、P95 6.01ms
 //
 // CPU 回退路径（RGA 失败时）：
 //  cv::cvtColor(capture_buffer_.dma.va, COLOR_YUV420sp2RGB)
@@ -597,7 +807,7 @@ void Video::captureLoop() {
 //  违反同步规则会导致 RGA fd 与 Mat data 指向不同物理内存，引发频闪
 void Video::bgrConvertLoop() {
     // RGA版本：直接从capture_buffer_.yuv_data（已注册RGA句柄）转换到bgr_write
-    // 无需再分配yuv_buffer局部缓冲，消除一次900KB的CPU memcpy
+    // 使用预分配DMA缓冲，不在正常RGA路径中临时申请图像内存
     int frame_counter = 0;
     
 #ifdef ENABLE_PERFORMANCE_TIMING
@@ -605,7 +815,7 @@ void Video::bgrConvertLoop() {
     long cvt_time_us, swap_time_us, inference_copy_time_us = 0;
 #endif
     
-    printf("[BGR转换线程] 启动 - RGA硬件加速模式（NV12→BGR，<5ms）\n");
+    printf("[BGR转换线程] 启动 - RGA硬件加速模式（NV12→RGB）\n");
     
     while(running_) {
         // 🔒 等待YUV数据就绪（条件变量阻塞等待，避免轮询）
@@ -634,18 +844,29 @@ void Video::bgrConvertLoop() {
         // RV1106 RGA2 只支持 DMA fd，不支持虚拟地址，必须用 wrapbuffer_fd
         rga_buffer_t rga_src = wrapbuffer_fd(capture_buffer_.dma.fd,
                                               width_, height_,
-                                              RK_FORMAT_YCbCr_420_SP);
+                                              RK_FORMAT_YCbCr_420_SP,
+                                              vir_width_, vir_height_);
         rga_buffer_t rga_dst = wrapbuffer_fd(bgr_buffer_.dma_write.fd,
                                               width_, height_,
-                                              RK_FORMAT_RGB_888);
+                                              RK_FORMAT_RGB_888,
+                                              vir_width_, vir_height_);
         IM_STATUS ret = imcvtcolor(rga_src, rga_dst,
                                    RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888,
                                    IM_YUV_TO_RGB_BT601_FULL);
         if (ret != IM_STATUS_SUCCESS) {
             // RGA失败时回退到CPU软件转换，保证不丢帧
             printf("[BGR转换] ⚠️ RGA转换失败(%d)，回退CPU cvtColor\n", ret);
-            cv::Mat yuv_mat(height_ + height_ / 2, width_, CV_8UC1,
-                            capture_buffer_.dma.va);
+            std::vector<unsigned char> compact(static_cast<size_t>(width_) * height_ * 3 / 2);
+            const unsigned char* padded = static_cast<const unsigned char*>(capture_buffer_.dma.va);
+            const unsigned char* padded_uv = padded + static_cast<size_t>(vir_width_) * vir_height_;
+            for (int row = 0; row < height_; ++row)
+                memcpy(compact.data() + static_cast<size_t>(row) * width_,
+                       padded + static_cast<size_t>(row) * vir_width_, width_);
+            unsigned char* compact_uv = compact.data() + static_cast<size_t>(width_) * height_;
+            for (int row = 0; row < height_ / 2; ++row)
+                memcpy(compact_uv + static_cast<size_t>(row) * width_,
+                       padded_uv + static_cast<size_t>(row) * vir_width_, width_);
+            cv::Mat yuv_mat(height_ + height_ / 2, width_, CV_8UC1, compact.data());
             // 输出 RGB 保持与 RGA 路径一致
             cv::cvtColor(yuv_mat, *bgr_buffer_.bgr_write, cv::COLOR_YUV420sp2RGB);
         }
@@ -711,8 +932,11 @@ void Video::bgrConvertLoop() {
 #ifdef ENABLE_PERFORMANCE_TIMING
         if (frame_counter % 30 == 0) {
             long total_us = cvt_time_us + swap_time_us + inference_copy_time_us;
-            printf("[BGR转换#%d] RGA NV12→BGR: %ld us, 指针轮换: %ld us, 推理轮换: %ld us, 总计: %ld us\n", 
-                   frame_counter, cvt_time_us, swap_time_us, inference_copy_time_us, total_us);
+            performanceLog(ai_enable_,
+                           "[RGB转换#%d] RGA NV12→RGB: %ld us, 指针轮换: %ld us, "
+                           "推理帧提交: %ld us, 总计: %ld us",
+                           frame_counter, cvt_time_us, swap_time_us,
+                           inference_copy_time_us, total_us);
         }
 #endif
         
@@ -726,13 +950,13 @@ void Video::bgrConvertLoop() {
 // 职责：对 RGB 帧做 letterbox 缩放后送入 RKNN YOLOv5，将结果写入 shared_detections_
 //
 // RGA letterbox 路径（主路径）：
-//  wrapbuffer_fd(bgr_dma_fd, RGB, 1280×720) →
+//  wrapbuffer_fd(bgr_dma_fd, RGB, 当前采集尺寸) →
 //  improcess(缩放到 scaledW×scaledH，写入 letterbox_dma_ 的 (leftPadding_,topPadding_) 偏移) →
 //  memcpy(letterbox_dma_.va → rknn_input_mems[0]->virt_addr)
 //
 //  letterbox 黑边只需在 initRgaBuffers() 时 memset(0) 一次，
 //  此后 RGA 每帧只写图像区域，黑边保持不变。
-//  耗时：<3ms（RGA 缩放，替代 CPU resize ~18ms）
+//  1080P实测：letterbox+输入拷贝平均7.88ms，RKNN平均117.33ms，总计平均125.21ms
 //
 // CPU 回退路径（RGA letterbox 失败时）：
 //  letterbox(bgr_mat)：CPU resize(INTER_NEAREST) + memset 黑边 + copyTo
@@ -814,7 +1038,8 @@ void Video::inferenceLoop() {
         // 格式统一为 RK_FORMAT_RGB_888（与 imcvtcolor 输出一致，推理模型期望 RGB NHWC）
         rga_buffer_t rga_lb_src = wrapbuffer_fd(bgr_dma_fd,
                                                   width_, height_,
-                                                  RK_FORMAT_RGB_888);
+                                                  RK_FORMAT_RGB_888,
+                                                  vir_width_, vir_height_);
         // dst: stride设为model_width_，使RGA直接以完整行宽写入，自然形成padding
         rga_buffer_t rga_lb_dst = wrapbuffer_fd(letterbox_dma_.fd,
                                                   model_width_, model_height_,
@@ -856,8 +1081,11 @@ void Video::inferenceLoop() {
         
         inference_counter++;
         if (inference_counter % 10 == 0) {
-            printf("[推理#%d] 指针交换: %ld us, letterbox: %ld us, RKNN推理: %ld us, 总计: %ld us\n", 
-                   inference_counter, swap_time_us, letterbox_time_us, inference_time_us, total_time_us);
+            performanceLog(true,
+                           "[推理#%d] 指针交换: %ld us, letterbox及输入拷贝: %ld us, "
+                           "RKNN推理: %ld us, 总计: %ld us",
+                           inference_counter, swap_time_us, letterbox_time_us,
+                           inference_time_us, total_time_us);
         }
 #endif
         
@@ -945,7 +1173,7 @@ void Video::inferenceLoop() {
 }
 
 // ============ Thread4：编码推流循环 ============
-// 职责：获取最新 RGB 帧，叠加检测框/FPS，H.264 编码后通过 RTSP 推流
+// 职责：获取最新RGB帧并叠加检测信息，H.264编码后同时提供给RTSP和录像线程
 //
 // 帧获取：
 //  加锁 → swap(dma_ready↔dma_read, bgr_ready↔bgr_read) → 解锁
@@ -960,14 +1188,15 @@ void Video::inferenceLoop() {
 // 编码路径：
 //  memcpy(frame_.data → VENC DMA MB data_) →
 //  RK_MPI_VENC_SendFrame → RK_MPI_VENC_GetStream →
-//  rtsp_tx_video → rtsp_do_event
+//  ├→ rtsp_tx_video → rtsp_do_event
+//  └→ Recording::enqueue → 有界内存队列 → 独立线程封装分片MP4
 //
-// 耗时分解（典型值）：
-//  - 指针交换：<1us
-//  - OpenCV 绘制：~2ms
-//  - H.264 编码：~12ms（VENC 硬件）
-//  - RTSP 推流：~1ms
-//  - 合计：~15ms，受上游 bgrConvertLoop(~32ms) 限制实际约 27fps
+// 1080P 稳定段实测（2026-09-23）：
+//  - AI关：绘制平均0.98ms，H.264平均20.68ms，总计平均33.86ms（约30fps）
+//  - AI开：绘制平均4.03ms，H.264平均27.63ms，总计平均36.87ms（约26.6fps）
+//  - AI开时的增幅主要来自 CPU调度和内存带宽竞争
+//  - RTSP 推流和录像入队分别计时，录像磁盘写入不阻塞本线程
+//  - Recording线程另行记录MP4封装、fflush和fdatasync耗时
 void Video::encodeLoop() {
     RK_S32 s32Ret;
     int last_processed_index = -1;  // 上次处理的帧序号（避免重复）
@@ -981,7 +1210,8 @@ void Video::encodeLoop() {
     
 #ifdef ENABLE_PERFORMANCE_TIMING
     struct timeval t_start, t_end;
-    long swap_time_us, draw_time_us, encode_time_us, rtsp_time_us, total_time_us;
+    long swap_time_us, draw_time_us, encode_time_us, rtsp_time_us;
+    long record_queue_time_us, total_time_us;
     int encode_counter = 0;
 #endif
     
@@ -1028,6 +1258,7 @@ void Video::encodeLoop() {
         
         // 使用read缓冲区的BGR数据（浅拷贝，共享数据指针，无性能损失）
         frame_ = *bgr_buffer_.bgr_read;
+        const bool ai_enabled_for_frame = ai_enable_;
         
 #ifdef ENABLE_PERFORMANCE_TIMING
         gettimeofday(&t_end, NULL);
@@ -1047,7 +1278,7 @@ void Video::encodeLoop() {
         
         // 绘制检测框（使用缓存结果，每帧都绘制）
         // ⚠️ frame_ 存储 RGB 字节序（RGA 输出 RK_FORMAT_RGB_888），Scalar(R,G,B)
-        if (ai_enable_ && has_detection_result_ && !cached_detections_.empty()) {
+        if (ai_enabled_for_frame && has_detection_result_ && !cached_detections_.empty()) {
             for (const auto& det : cached_detections_) {
                 cv::rectangle(frame_, 
                             cv::Point(det.x, det.y), 
@@ -1138,7 +1369,12 @@ void Video::encodeLoop() {
         // 编码
         h264_frame_.stVFrame.u32TimeRef = H264_TimeRef_++;
         h264_frame_.stVFrame.u64PTS = timestamp;
-        memcpy(data_, frame_.data, width_ * height_ * 3);
+        const size_t visible_row_bytes = static_cast<size_t>(width_) * 3;
+        const size_t venc_row_bytes = visible_row_bytes;
+        for (int row = 0; row < height_; ++row) {
+            memcpy(data_ + static_cast<size_t>(row) * venc_row_bytes,
+                   frame_.ptr(row), visible_row_bytes);
+        }
         
         RK_S32 sendRet = RK_MPI_VENC_SendFrame(0, &h264_frame_, -1);
         if (sendRet != RK_SUCCESS) {
@@ -1150,33 +1386,51 @@ void Video::encodeLoop() {
 #ifdef ENABLE_PERFORMANCE_TIMING
         gettimeofday(&t_end, NULL);
         encode_time_us = (t_end.tv_sec - t_start.tv_sec) * 1000000 + (t_end.tv_usec - t_start.tv_usec);
-        gettimeofday(&t_start, NULL);
+        rtsp_time_us = 0;
+        record_queue_time_us = 0;
 #endif
         
         // 推流
         if (s32Ret == RK_SUCCESS) {
             void *pData = RK_MPI_MB_Handle2VirAddr(stFrame_.pstPack->pMbBlk);
             if (pData && stFrame_.pstPack->u32Len) {
+#ifdef ENABLE_PERFORMANCE_TIMING
+                gettimeofday(&t_start, NULL);
+#endif
                 if (g_rtsplive_ && g_rtsp_session_) {
                     rtsp_tx_video(g_rtsp_session_, (uint8_t *)pData,
                                   stFrame_.pstPack->u32Len, stFrame_.pstPack->u64PTS);
                     rtsp_do_event(g_rtsplive_);
                 }
-                recording_.enqueue(pData, stFrame_.pstPack->u32Len, stFrame_.pstPack->u64PTS);
+#ifdef ENABLE_PERFORMANCE_TIMING
+                gettimeofday(&t_end, NULL);
+                rtsp_time_us = (t_end.tv_sec - t_start.tv_sec) * 1000000 +
+                               (t_end.tv_usec - t_start.tv_usec);
+                gettimeofday(&t_start, NULL);
+#endif
+                recording_.enqueue(pData, stFrame_.pstPack->u32Len,
+                                   stFrame_.pstPack->u64PTS, ai_enabled_for_frame);
+#ifdef ENABLE_PERFORMANCE_TIMING
+                gettimeofday(&t_end, NULL);
+                record_queue_time_us = (t_end.tv_sec - t_start.tv_sec) * 1000000 +
+                                       (t_end.tv_usec - t_start.tv_usec);
+#endif
             }
         } else {
             fprintf(stderr, "[Video] VENC GetStream 失败: %d\n", s32Ret);
         }
         
 #ifdef ENABLE_PERFORMANCE_TIMING
-        gettimeofday(&t_end, NULL);
-        rtsp_time_us = (t_end.tv_sec - t_start.tv_sec) * 1000000 + (t_end.tv_usec - t_start.tv_usec);
-        total_time_us = swap_time_us + draw_time_us + encode_time_us + rtsp_time_us;
+        total_time_us = swap_time_us + draw_time_us + encode_time_us +
+                        rtsp_time_us + record_queue_time_us;
         
         encode_counter++;
         if (encode_counter % 30 == 0) {
-            printf("[编码#%d] 指针交换: %ld us, 绘制: %ld us, H.264: %ld us, RTSP: %ld us, 总计: %ld us\n", 
-                   encode_counter, swap_time_us, draw_time_us, encode_time_us, rtsp_time_us, total_time_us);
+            performanceLog(ai_enabled_for_frame,
+                           "[编码#%d] 指针交换: %ld us, 画面叠加: %ld us, "
+                           "H.264编码: %ld us, RTSP: %ld us, 录像入队: %ld us, 总计: %ld us",
+                           encode_counter, swap_time_us, draw_time_us, encode_time_us,
+                           rtsp_time_us, record_queue_time_us, total_time_us);
         }
 #endif
         
@@ -1188,7 +1442,7 @@ void Video::encodeLoop() {
 
 /**
  * @brief CPU 版 letterbox 缩放（RGA 路径失败时的回退实现）
- * @param input 输入图像（RGB 或 BGR，1280×720，CV_8UC3）
+ * @param input 输入图像（RGB 或 BGR，当前采集尺寸，CV_8UC3）
  * @return 640×640 letterbox 图像（通道顺序与输入相同，黑边填 0）
  *
  * 实现步骤：
@@ -1305,9 +1559,11 @@ void Video::getObjectList(const std::vector<int>& objList) {
 
 void Video::startAI() {
     ai_enable_ = true;
+    performanceLog(true, "[状态] AI推理已开启");
 }
 void Video::stopAI() {
     ai_enable_ = false;
+    performanceLog(false, "[状态] AI推理已关闭");
 }
 void Video::startAreaDetect() {
     area_enable_ = true;

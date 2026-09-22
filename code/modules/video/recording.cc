@@ -179,7 +179,8 @@ Recording::Recording(int width, int height)
       width_(width), height_(height), last_pts_(0), last_duration_(3000), samples_(0),
       segment_start_ms_(0), segment_last_ms_(0),
       segment_bytes_(0), last_maintenance_ms_(0), last_sync_ms_(0),
-      interval_mux_us_(0), interval_mux_samples_(0) {
+      interval_mux_us_(0), interval_mux_samples_(0),
+      performance_log_callback_(nullptr), performance_log_user_data_(nullptr) {
     while (root_path_.size() > 1 && root_path_.back() == '/') root_path_.pop_back();
     directory_ = root_path_ + "/recordings";
     pthread_mutex_init(&mutex_, nullptr);
@@ -317,7 +318,12 @@ void Recording::stop() {
     }
 }
 
-void Recording::enqueue(const void* data, size_t size, uint64_t pts) {
+void Recording::setPerformanceLogCallback(PerformanceLogCallback callback, void* user_data) {
+    performance_log_callback_ = callback;
+    performance_log_user_data_ = user_data;
+}
+
+void Recording::enqueue(const void* data, size_t size, uint64_t pts, bool ai_enabled) {
     if (!data || !size) return;
     const unsigned char* bytes = static_cast<const unsigned char*>(data);
     const bool idr = containsIdr(bytes, size);
@@ -341,6 +347,7 @@ void Recording::enqueue(const void* data, size_t size, uint64_t pts) {
     packet.wall_ms = nowMs();
     packet.idr = idr;
     packet.discontinuity = discontinuity_pending_;
+    packet.ai_enabled = ai_enabled;
     discontinuity_pending_ = false;
     if (idr) dropping_ = false;
     queued_bytes_ += size;
@@ -516,13 +523,20 @@ bool Recording::writePacket(const Packet& packet) {
             closeSegment(false);
             return false;
         }
-        printf("[Recording] MP4性能: 封装 %llu 帧/%llu us, fflush %llu us, "
-               "fdatasync %llu us, 本次同步总计 %llu us\n",
-               (unsigned long long)interval_mux_samples_,
-               (unsigned long long)interval_mux_us_,
-               (unsigned long long)(flush_end_us - flush_begin_us),
-               (unsigned long long)(sync_end_us - flush_end_us),
-               (unsigned long long)(sync_end_us - flush_begin_us));
+        char message[320];
+        snprintf(message, sizeof(message),
+                 "[录像] MP4封装: %llu 帧/%llu us, fflush: %llu us, "
+                 "fdatasync: %llu us, 同步总计: %llu us",
+                 (unsigned long long)interval_mux_samples_,
+                 (unsigned long long)interval_mux_us_,
+                 (unsigned long long)(flush_end_us - flush_begin_us),
+                 (unsigned long long)(sync_end_us - flush_end_us),
+                 (unsigned long long)(sync_end_us - flush_begin_us));
+        if (performance_log_callback_)
+            performance_log_callback_(packet.ai_enabled, message,
+                                      performance_log_user_data_);
+        else
+            printf("%s\n", message);
         interval_mux_us_ = 0;
         interval_mux_samples_ = 0;
         last_sync_ms_ = packet.wall_ms;

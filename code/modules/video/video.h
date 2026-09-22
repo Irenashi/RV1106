@@ -8,20 +8,23 @@
  * │  Thread1: captureLoop   (30fps)                                 │
  * │    VI硬件 → NV12(DMA) ──memcpy──→ capture_buffer(DMA)          │
  * │                                         │                       │
- * │  Thread2: bgrConvertLoop (≈27fps)       │                       │
+ * │  Thread2: bgrConvertLoop (30fps)        │                       │
  * │    ←── capture_buffer(DMA fd)           │                       │
- * │    RGA imcvtcolor: NV12→RGB (<5ms)      │                       │
+ * │    RGA imcvtcolor: NV12→RGB (约4–6ms)   │                       │
  * │    → bgr_buffer 三缓冲(DMA) ──┬─────────┘                       │
  * │                               │                                 │
- * │  Thread3: inferenceLoop (≈6fps)│                                │
+ * │  Thread3: inferenceLoop (≈7.5fps)│                              │
  * │    ←── inference_bgr_buffer ──┘                                 │
- * │    RGA improcess: letterbox 缩放+填充 (<3ms)                     │
- * │    → RKNN YOLOv5 推理 (~96ms) → shared_detections_             │
+ * │    letterbox+输入拷贝 (约5–12ms)                            │
+ * │    → RKNN YOLOv5 推理 (约117ms) → shared_detections_           │
  * │                                                                 │
- * │  Thread4: encodeLoop (≈27fps)                                   │
+ * │  Thread4: encodeLoop (26–30fps)                                 │
  * │    ←── bgr_buffer(DMA fd)                                       │
- * │    OpenCV 绘制检测框/FPS                                         │
- * │    → VENC H.264 硬件编码 → RTSP 推流                            │
+ * │    OpenCV 绘制检测框/FPS                                        │
+ * │    → VENC H.264 ─┬→ RTSP 推流                                  │
+ * │                  └→ Recording 有界队列                         │
+ * │                         ↓                                       │
+ * │  Thread5: Recording → 分片MP4 → SD卡同步/清理/断电恢复          │
  * └─────────────────────────────────────────────────────────────────┘
  *
  * 关键设计：
@@ -35,13 +38,17 @@
 #define VIDEO_H
 
 // ==================== 性能调试开关 ====================
-#define ENABLE_PERFORMANCE_TIMING   // 开启各线程逐步耗时打印（30帧/次）
+#define ENABLE_PERFORMANCE_CONSOLE  // 将各阶段耗时输出到终端
+#define ENABLE_PERFORMANCE_FILE     // 写入/root/record/logs下的AI_ON/AI_OFF TXT文件
+#if defined(ENABLE_PERFORMANCE_CONSOLE) || defined(ENABLE_PERFORMANCE_FILE)
+#define ENABLE_PERFORMANCE_TIMING   // 内部计时总开关，请通过上面两个宏控制
+#endif
 // #define ENABLE_FPS_CONSOLE       // 开启终端 FPS 输出
 #define ENABLE_FPS_DISPLAY          // 开启画面右上角北京时间 + FPS 叠加显示
 
 // ==================== 系统配置参数 ====================
-#define IMAGE_WIDTH           1280   // 采集/编码分辨率：宽（像素）
-#define IMAGE_HEIGHT          720   // 采集/编码分辨率：高（像素）
+#define IMAGE_WIDTH           1920   // 有效采集和编码宽度
+#define IMAGE_HEIGHT          1080   // 有效采集和编码高度
 #define MODEL_WIDTH           640   // YOLOv5 模型输入宽度
 #define MODEL_HEIGHT          640   // YOLOv5 模型输入高度
 #define INFERENCE_FRAME_SKIP  3     // 推理跳帧数：每 (N+1) 帧推理 1 次，3 → 每4帧推1次
@@ -266,6 +273,8 @@ private:
     static void* bgrConvertThreadFunc(void* arg); // → bgrConvertLoop()
     static void* inferenceThreadFunc(void* arg);  // → inferenceLoop()
     static void* encodeThreadFunc(void* arg);     // → encodeLoop()
+    static void recordingPerformanceLog(bool ai_enabled, const char* message,
+                                        void* user_data);
 
     // ==================== 线程主循环 ====================
 
@@ -274,40 +283,40 @@ private:
      *
      * RK_MPI_VI_GetChnFrame → memcpy(vi_data → capture_buffer_.dma.va) → Release
      * 不检查 ready 状态，直接覆盖，保证采集实时性（下游允许丢帧）。
-     * 耗时：VI 获取 ~30ms（硬件同步），YUV memcpy ~2ms（900KB）
+     * 实际耗时由性能日志每30帧记录一次，适配不同采集分辨率和VI步长。
      */
     void captureLoop();
 
     /**
-     * @brief RGB 转换循环（Thread2，~27fps，系统吞吐瓶颈）
+     * @brief RGB 转换循环（Thread2，1080P实测约30fps）
      *
      * 等待 capture_buffer_.ready → RGA imcvtcolor(NV12→RGB) → 三缓冲轮换
      * RGA 格式：RK_FORMAT_YCbCr_420_SP → RK_FORMAT_RGB_888（BT.601 Full Range）
      * 每 (INFERENCE_FRAME_SKIP+1) 帧额外向 inference_bgr_buffer_ 传递一帧。
-     * 耗时：RGA 转换 <5ms（对比 CPU cvtColor ~32ms）
+     * 1080P实测：AI关平均4.07ms；AI开平均4.84ms、P95 6.01ms。
      */
     void bgrConvertLoop();
 
     /**
-     * @brief 推理循环（Thread3，~6fps，受 NPU 速度限制）
+     * @brief 推理循环（Thread3，1080P实测约7.5fps，受 NPU 速度限制）
      *
      * 等待 inference_bgr_buffer_.ready →
-     *   RGA improcess letterbox(RGB 1280×720 → RGB 640×640，带黑边填充) →
+     *   RGA improcess letterbox(RGB采集尺寸 → RGB 640×640，带黑边填充) →
      *   memcpy(letterbox_dma_.va → rknn_input_mems) →
      *   inference_yolov5_model → 更新 shared_detections_
      * letterbox 黑边在 initRgaBuffers() 时预填充，此后 RGA 仅写图像区域，无需每帧 memset。
-     * 耗时：RGA letterbox <3ms + RKNN 推理 ~96ms
+     * 1080P实测：letterbox+拷贝平均7.88ms + RKNN平均117.33ms，总计平均125.21ms。
      */
     void inferenceLoop();
 
     /**
-     * @brief 编码推流循环（Thread4，~27fps）
+     * @brief 编码推流循环（Thread4，1080P实测 AI关30fps / AI开约26.6fps）
      *
      * 等待 bgr_buffer_.ready → OpenCV 绘制检测框/北京时间/FPS →
      *   memcpy(frame_.data → VENC DMA MB) →
-     *   RK_MPI_VENC_SendFrame → RK_MPI_VENC_GetStream → RTSP 推流
+     *   RK_MPI_VENC_SendFrame → RK_MPI_VENC_GetStream → RTSP推流 + 录像队列
      * frame_ 为 RGB 字节序（CV_8UC3），Scalar(R,G,B) 通道顺序与 BGR Mat 相反。
-     * 耗时：绘制 ~2ms + H.264 编码 ~12ms + RTSP ~1ms
+     * RTSP和录像入队分别计时；MP4封装与SD卡同步由Recording线程统计。
      */
     void encodeLoop();
 
@@ -315,7 +324,7 @@ private:
 
     /**
      * @brief CPU 版 letterbox（RGA 失败时的回退路径）
-     * @param input BGR/RGB Mat（1280×720）
+     * @param input BGR/RGB Mat（当前采集尺寸）
      * @return 640×640 letterbox Mat（相同通道顺序，黑边填充）
      * 使用 INTER_NEAREST 插值（比 INTER_LINEAR 快 2~5 倍）。
      */
@@ -346,12 +355,17 @@ private:
      * @return "DETECTIONS:N|cls_id:name:x:y:w:h:conf|..." 格式
      */
     std::string buildDetectionSummary();
+    void performanceLog(bool ai_enabled, const char* format, ...);
+    FILE* openPerformanceLog(bool ai_enabled);
+    void closePerformanceLogs();
 
     // ==================== 成员变量 ====================
 
     // --- 视频分辨率参数 ---
     int   width_;        // 采集/编码宽度（像素）
     int   height_;       // 采集/编码高度（像素）
+    int   vir_width_;    // 内部 VI/RGA DMA 水平步长（16像素对齐）
+    int   vir_height_;   // 内部 VI/RGA DMA 垂直步长（16像素对齐）
     int   model_width_;  // RKNN 模型输入宽度
     int   model_height_; // RKNN 模型输入高度
     float scale_;        // letterbox 等比缩放系数（min(W_scale, H_scale)）
@@ -387,12 +401,20 @@ private:
     rtsp_session_handle g_rtsp_session_;  // RTSP 会话句柄（/live/0）
     Recording           recording_;       // SD 卡录像线程，复用 VENC 的 H.264 输出
 
+    // --- 性能日志（同一运行会话按AI开关分文件）---
+    pthread_mutex_t performance_log_mutex_;
+    FILE*           performance_ai_on_file_;
+    FILE*           performance_ai_off_file_;
+    std::string     performance_log_directory_;
+    std::string     performance_session_name_;
+
     // --- 线程管理 ---
     pthread_t thread_capture_;     // 采集线程 tid
     pthread_t thread_bgr_convert_; // RGB 转换线程 tid
     pthread_t thread_inference_;   // 推理线程 tid
     pthread_t thread_encode_;      // 编码推流线程 tid
     bool      running_;            // 全局运行标志（false → 各线程退出循环）
+    bool      resources_released_; // 防止显式 stop 后析构再次释放硬件资源
 
     // --- AI 功能开关 ---
     bool ai_enable_;   // true = inferenceLoop 处理帧，false = 休眠

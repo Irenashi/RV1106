@@ -55,7 +55,7 @@
   - **RGA 转换加速**：使用 RGA 硬件进行图像格式转换 (NV12->RGB888) 与自动缩放插络，零 CPU 消耗完成预处理。
   - **NPU 智能推理**：RKNN 提供底层 AI 算力。
   - **VPU 硬件编码**：对叠加了检测框后的最终画面进行 H.264 硬件视频编码。
-  - 当前直播与录像共用 **1280×720、30 fps、H.264 8 Mbit/s** 编码配置；实际帧率和录像稳定性需在设备上验证。
+  - 当前直播与录像共用 **1920×1080、30 fps、H.264 8 Mbit/s** 编码配置；内部 VI/RGA 缓冲会独立处理硬件步长。
 
 - **🎯 实时多目标检测 (AI 智能分析)**：
   - 基于 YOLOv5 算法和 Rockchip NPU (RKNN) 硬件加速，支持高达 80 种 COCO 类别目标的实时检测。
@@ -140,6 +140,8 @@ cd /root/install
 录像数据定期同步到 SD 卡；意外断电或复位后，程序会在下次启动时恢复可用的 `.part` 文件。存储目录、容量限制、保留时间、切片时长和同步间隔均可通过环境变量配置。
 
 开发板通过默认端口 `18080` 提供录像列表和支持 HTTP Range 的 MP4 文件接口，Qt 上位机已完成录像查询、播放和进度跳转适配。接口说明见 [`docs/RECORDING_HTTP_API.md`](docs/RECORDING_HTTP_API.md)。
+
+性能统计由 `video.h` 中的 `ENABLE_PERFORMANCE_CONSOLE` 和 `ENABLE_PERFORMANCE_FILE` 分别控制终端输出与文件记录。TXT 默认保存到 `/root/record/logs`，同一次运行按 `AI_ON` 和 `AI_OFF` 分开记录；可通过 `IRC_PERFORMANCE_LOG_DIR` 指定其他绝对目录。
 
 ```text
 [Camera/VI]
