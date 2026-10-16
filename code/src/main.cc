@@ -26,7 +26,7 @@ static void sigterm_handler(int sig) {
     quit = 1;
 }
 
-// 获取本机IP地址（优先获取eth0，其次wlan0）
+// 获取本机（代码运行的机器）IP地址（优先获取eth0，其次wlan0）
 std::string getLocalIP() {
     struct ifaddrs * ifAddrStruct = NULL;
     struct ifaddrs * ifa = NULL;
